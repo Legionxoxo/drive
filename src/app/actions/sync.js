@@ -10,11 +10,9 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const SYNC_FOLDER =
-    process.env.SYNC_FOLDER || path.join(process.cwd(), "sync_folder");
-const DRIVE_FOLDER_NAME = path.basename(SYNC_FOLDER);
 let watcher = null;
 
+// Helper function to log messages with a timestamp
 function log(message) {
     console.log(`[${new Date().toISOString()}] ${message}`);
 }
@@ -32,7 +30,8 @@ async function initializeDrive() {
     return google.drive({ version: "v3", auth: oauth2Client });
 }
 
-async function createOrGetDriveFolder(drive) {
+async function createOrGetDriveFolder(drive, SYNC_FOLDER) {
+    const DRIVE_FOLDER_NAME = path.basename(SYNC_FOLDER); // Use the selected folder's name
     const folderMetadata = {
         name: DRIVE_FOLDER_NAME,
         mimeType: "application/vnd.google-apps.folder",
@@ -161,7 +160,7 @@ async function retryWithBackoff(fn, maxRetries = 5) {
     }
 }
 
-async function downloadLargeFile(drive, fileId, fileName) {
+async function downloadLargeFile(drive, fileId, fileName, SYNC_FOLDER) {
     const filePath = path.join(SYNC_FOLDER, fileName);
     const dest = fs.createWriteStream(filePath);
 
@@ -181,7 +180,7 @@ async function downloadLargeFile(drive, fileId, fileName) {
     });
 }
 
-async function initialUpload(drive, folderId) {
+async function initialUpload(drive, folderId, SYNC_FOLDER) {
     const files = fs.readdirSync(SYNC_FOLDER);
     for (const file of files) {
         const filePath = path.join(SYNC_FOLDER, file);
@@ -191,7 +190,7 @@ async function initialUpload(drive, folderId) {
     }
 }
 
-async function initialDownload(drive, folderId) {
+async function initialDownload(drive, folderId, SYNC_FOLDER) {
     const response = await drive.files.list({
         q: `'${folderId}' in parents`,
         fields: "files(id, name, modifiedTime)",
@@ -212,13 +211,13 @@ async function initialDownload(drive, folderId) {
 
         // Check if the file exists locally
         if (!localFiles.has(file.name)) {
-            await downloadLargeFile(drive, file.id, file.name);
+            await downloadLargeFile(drive, file.id, file.name, SYNC_FOLDER);
         } else {
             // Check if the local file is outdated compared to the file in Drive
             const localMTime = fs.statSync(filePath).mtime.toISOString();
             if (new Date(file.modifiedTime) > new Date(localMTime)) {
                 log(`Updating ${file.name} as the local version is outdated.`);
-                await downloadLargeFile(drive, file.id, file.name);
+                await downloadLargeFile(drive, file.id, file.name, SYNC_FOLDER);
             }
         }
     }
@@ -236,8 +235,42 @@ async function deleteFile(drive, fileName, folderId) {
     }
 }
 
-export async function startSync() {
+// Add this helper function to recursively get all files
+async function getAllFiles(folderPath) {
+    const files = [];
+
+    async function scanDirectory(currentPath, relativePath = "") {
+        const entries = fs.readdirSync(currentPath);
+
+        for (const entry of entries) {
+            const fullPath = path.join(currentPath, entry);
+            const entryStats = fs.statSync(fullPath);
+
+            if (entryStats.isDirectory()) {
+                await scanDirectory(fullPath, path.join(relativePath, entry));
+            } else if (entryStats.isFile()) {
+                files.push({
+                    fullPath,
+                    relativePath: path.join(relativePath, entry),
+                    modifiedTime: entryStats.mtime,
+                    size: entryStats.size,
+                });
+            }
+        }
+    }
+
+    await scanDirectory(folderPath);
+    return files;
+}
+
+export async function startSync(syncFolder) {
     log("Starting sync process");
+    if (!syncFolder) {
+        throw new Error("No folder selected for syncing");
+    }
+
+    const folderPath = path.resolve(syncFolder);
+
     const session = await getServerSession(authOptions);
     if (!session || !session.accessToken) {
         throw new Error("Not authenticated");
@@ -248,15 +281,15 @@ export async function startSync() {
 
     const drive = google.drive({ version: "v3", auth: oauth2Client });
 
-    if (!fs.existsSync(SYNC_FOLDER)) {
-        fs.mkdirSync(SYNC_FOLDER);
+    if (!fs.existsSync(folderPath)) {
+        fs.mkdirSync(folderPath);
     }
 
-    const folderId = await createOrGetDriveFolder(drive);
-    await initialUpload(drive, folderId);
-    await initialDownload(drive, folderId);
+    const folderId = await createOrGetDriveFolder(drive, folderPath);
+    await initialUpload(drive, folderId, folderPath);
+    await initialDownload(drive, folderId, folderPath);
 
-    watcher = chokidar.watch(SYNC_FOLDER, {
+    watcher = chokidar.watch(folderPath, {
         ignored: /(^|[\/\\])\../,
         persistent: true,
     });
@@ -287,58 +320,117 @@ export async function stopSync() {
     }
 }
 
-export async function startPush() {
+export async function startPush(syncFolder) {
     log("Starting push sync to Google Drive...");
+    if (!syncFolder) {
+        throw new Error("No folder selected for syncing");
+    }
+
+    const folderPath = path.resolve(syncFolder);
+    log(`Using sync folder: ${folderPath}`);
 
     try {
         // Initialize Drive client
         const drive = await initializeDrive();
 
-        // Create or get folder ID
-        const folderId = await createOrGetDriveFolder(drive);
+        // Create or get root folder ID
+        const rootFolderId = await createOrGetDriveFolder(drive, folderPath);
 
-        // Get all local files
-        if (!fs.existsSync(SYNC_FOLDER)) {
-            fs.mkdirSync(SYNC_FOLDER, { recursive: true });
+        // Get all local files including those in subfolders
+        if (!fs.existsSync(folderPath)) {
+            fs.mkdirSync(folderPath, { recursive: true });
             log("Created sync folder as it didn't exist");
             return;
         }
 
-        const localFiles = fs
-            .readdirSync(SYNC_FOLDER)
-            .filter((file) =>
-                fs.statSync(path.join(SYNC_FOLDER, file)).isFile()
-            );
+        // Get all files recursively
+        const localFiles = await getAllFiles(folderPath);
+        log(`Found ${localFiles.length} files in total`);
 
-        log(`Found ${localFiles.length} files in local folder`);
+        // Create a map to store folder IDs
+        const folderIds = new Map();
+        folderIds.set("", rootFolderId); // Root folder
 
-        // Get existing files in Drive folder
-        const response = await drive.files.list({
-            q: `'${folderId}' in parents and trashed = false`,
-            fields: "files(id, name, modifiedTime)",
-            pageSize: 1000,
-        });
+        // Function to ensure folder exists in Drive
+        async function ensureFolderExists(relativePath) {
+            if (folderIds.has(relativePath)) {
+                return folderIds.get(relativePath);
+            }
 
-        const driveFiles = response.data.files.reduce((acc, file) => {
-            acc[file.name] = {
-                id: file.id,
-                modifiedTime: new Date(file.modifiedTime),
+            const parentPath = path.dirname(relativePath);
+            const folderName = path.basename(relativePath);
+            const parentId = await ensureFolderExists(parentPath);
+
+            // Create folder in Drive
+            const folderMetadata = {
+                name: folderName,
+                mimeType: "application/vnd.google-apps.folder",
+                parents: [parentId],
             };
-            return acc;
-        }, {});
+
+            const folder = await drive.files.create({
+                resource: folderMetadata,
+                fields: "id",
+            });
+
+            folderIds.set(relativePath, folder.data.id);
+            return folder.data.id;
+        }
+
+        // Get existing files in Drive folder (recursively)
+        async function getDriveFiles(folderId) {
+            const allFiles = new Map();
+            let pageToken = null;
+
+            do {
+                const response = await drive.files.list({
+                    q: `'${folderId}' in parents and trashed = false`, // Exclude trashed files
+                    fields: "nextPageToken, files(id, name, modifiedTime, parents)",
+                    pageSize: 1000,
+                    pageToken: pageToken,
+                });
+
+                for (const file of response.data.files) {
+                    const filePath = file.parents
+                        ? file.parents.join("/") + "/" + file.name
+                        : file.name;
+                    allFiles.set(filePath, {
+                        id: file.id,
+                        modifiedTime: new Date(file.modifiedTime),
+                    });
+                }
+
+                pageToken = response.data.nextPageToken;
+            } while (pageToken);
+
+            return allFiles;
+        }
+
+        const driveFiles = await getDriveFiles(rootFolderId);
 
         // Process each local file
-        for (const fileName of localFiles) {
-            const filePath = path.join(SYNC_FOLDER, fileName);
-            const localModifiedTime = fs.statSync(filePath).mtime;
-            const driveFile = driveFiles[fileName];
+        for (const file of localFiles) {
+            try {
+                // Ensure parent folder exists in Drive
+                const parentPath = path.dirname(file.relativePath);
+                const parentId =
+                    parentPath === "."
+                        ? rootFolderId
+                        : await ensureFolderExists(parentPath);
 
-            if (!driveFile || localModifiedTime > driveFile.modifiedTime) {
-                const fileSize = fs.statSync(filePath).size;
-                log(`Uploading ${fileName} (${formatFileSize(fileSize)})...`);
-                await uploadLargeFile(drive, filePath, folderId);
-            } else {
-                log(`Skipping ${fileName} - Drive copy is up to date`);
+                const fileName = path.basename(file.fullPath);
+                const driveFile = driveFiles.get(file.relativePath);
+
+                if (!driveFile || file.modifiedTime > driveFile.modifiedTime) {
+                    log(`Uploading ${file.relativePath}`);
+                    await uploadLargeFile(drive, file.fullPath, parentId);
+                } else {
+                    log(
+                        `Skipping ${file.relativePath} - Drive copy is up to date`
+                    );
+                }
+            } catch (error) {
+                log(`Error processing ${file.relativePath}: ${error.message}`);
             }
         }
 
@@ -349,42 +441,44 @@ export async function startPush() {
     }
 }
 
-export async function startPull() {
+export async function startPull(driveFolderId) {
     log("Starting pull sync from Google Drive...");
+    if (!driveFolderId) {
+        throw new Error("No Google Drive folder selected for pulling");
+    }
+
+    const folderPath = path.resolve("local_sync_folder"); // Define your local sync folder path
+    log(`Using local sync folder: ${folderPath}`);
 
     try {
         // Initialize Drive client
         const drive = await initializeDrive();
 
-        // Create or get folder ID
-        const folderId = await createOrGetDriveFolder(drive);
-
         // Create sync folder if it doesn't exist
-        if (!fs.existsSync(SYNC_FOLDER)) {
-            fs.mkdirSync(SYNC_FOLDER, { recursive: true });
+        if (!fs.existsSync(folderPath)) {
+            fs.mkdirSync(folderPath, { recursive: true });
         }
 
-        // Get all files from the Drive folder
+        // Get all files from the selected Drive folder
         const response = await drive.files.list({
-            q: `'${folderId}' in parents and trashed = false`,
+            q: `'${driveFolderId}' in parents and trashed = false`,
             fields: "files(id, name, modifiedTime, size)",
             pageSize: 1000,
         });
 
         const driveFiles = response.data.files;
         log(`Found ${driveFiles.length} files in Google Drive`);
-        log(JSON.stringify(driveFiles, null, 2));
 
         // Get local files info
-        const localFiles = fs.existsSync(SYNC_FOLDER)
+        const localFiles = fs.existsSync(folderPath)
             ? fs
-                  .readdirSync(SYNC_FOLDER)
+                  .readdirSync(folderPath)
                   .filter((file) =>
-                      fs.statSync(path.join(SYNC_FOLDER, file)).isFile()
+                      fs.statSync(path.join(folderPath, file)).isFile()
                   )
                   .reduce((acc, file) => {
                       acc[file] = fs.statSync(
-                          path.join(SYNC_FOLDER, file)
+                          path.join(folderPath, file)
                       ).mtime;
                       return acc;
                   }, {})
@@ -392,7 +486,7 @@ export async function startPull() {
 
         // Process each file from Google Drive
         for (const file of driveFiles) {
-            const localPath = path.join(SYNC_FOLDER, file.name);
+            const localPath = path.join(folderPath, file.name);
             const driveModifiedTime = new Date(file.modifiedTime);
             const localModifiedTime = localFiles[file.name]
                 ? new Date(localFiles[file.name])
@@ -406,7 +500,7 @@ export async function startPull() {
                 log(
                     `Downloading ${file.name} (${formatFileSize(file.size)})...`
                 );
-                await downloadLargeFile(drive, file.id, file.name);
+                await downloadLargeFile(drive, file.id, file.name, folderPath);
             } else {
                 log(`Skipping ${file.name} - local copy is up to date`);
             }
@@ -419,10 +513,13 @@ export async function startPull() {
     }
 }
 
-// The existing helper function for file size formatting
+// Helper function for formatting file sizes
 function formatFileSize(bytes) {
+    if (bytes === undefined) return "Unknown size";
     const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
-    if (bytes === 0) return "0 Byte";
+    if (bytes === 0) return "0 Bytes";
     const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
     return Math.round((bytes / Math.pow(1024, i)) * 100) / 100 + " " + sizes[i];
 }
+
+// The remaining methods (startPush, startPull, etc.) will follow the same approach, passing SYNC_FOLDER as a parameter where needed.
