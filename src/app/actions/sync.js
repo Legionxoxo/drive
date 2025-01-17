@@ -185,24 +185,32 @@ async function retryWithBackoff(fn, maxRetries = 5) {
     }
 }
 
-async function downloadLargeFile(drive, fileId, fileName, SYNC_FOLDER) {
-    const filePath = path.join(SYNC_FOLDER, fileName);
+async function downloadLargeFile(drive, fileId, fileName, targetPath) {
+    const filePath = path.join(targetPath, fileName);
     const dest = fs.createWriteStream(filePath);
 
-    const response = await drive.files.get(
-        { fileId: fileId, alt: "media" },
-        { responseType: "stream" }
-    );
+    try {
+        const response = await drive.files.get(
+            { fileId: fileId, alt: "media" },
+            { responseType: "stream" }
+        );
 
-    response.data.pipe(dest);
+        response.data.pipe(dest);
 
-    return new Promise((resolve, reject) => {
-        dest.on("finish", () => {
-            log(`Downloaded ${fileName} from Google Drive.`);
-            resolve();
+        return new Promise((resolve, reject) => {
+            dest.on("finish", () => {
+                log(`Downloaded ${fileName} to ${filePath}`);
+                resolve();
+            });
+            dest.on("error", (error) => {
+                log(`Error downloading ${fileName}: ${error.message}`);
+                reject(error);
+            });
         });
-        dest.on("error", reject);
-    });
+    } catch (error) {
+        log(`Error getting file ${fileName}: ${error.message}`);
+        throw error;
+    }
 }
 
 async function initialUpload(drive, folderId, SYNC_FOLDER) {
@@ -547,71 +555,83 @@ async function uploadFileFromHandle(drive, file, folderId) {
     }
 }
 
-export async function startPull(driveFolderId) {
+export async function startPull(driveFolderId, localFolderPath) {
     log("Starting pull sync from Google Drive...");
     if (!driveFolderId) {
         throw new Error("No Google Drive folder selected for pulling");
     }
+    if (!localFolderPath) {
+        throw new Error("No local folder selected for pulling");
+    }
 
-    const folderPath = path.resolve(syncFolder);
+    const normalizedPath = localFolderPath.replace(/\//g, path.sep);
+    const folderPath = path.resolve(normalizedPath);
     log(`Using local sync folder: ${folderPath}`);
 
     try {
-        // Initialize Drive client
         const drive = await initializeDrive();
 
-        // Create sync folder if it doesn't exist
+        // Create base folder if it doesn't exist
         if (!fs.existsSync(folderPath)) {
             fs.mkdirSync(folderPath, { recursive: true });
         }
 
-        // Get all files from the selected Drive folder
-        const response = await drive.files.list({
-            q: `'${driveFolderId}' in parents and trashed = false`,
-            fields: "files(id, name, modifiedTime, size)",
-            pageSize: 1000,
-        });
+        // Helper function to recursively fetch and download files
+        async function pullFolderContents(folderId, currentPath) {
+            // Get all items (files and folders) from the current Drive folder
+            const response = await drive.files.list({
+                q: `'${folderId}' in parents and trashed = false`,
+                fields: "files(id, name, mimeType, modifiedTime, size)",
+                pageSize: 1000,
+            });
 
-        const driveFiles = response.data.files;
-        log(`Found ${driveFiles.length} files in Google Drive`);
+            const items = response.data.files;
+            log(`Found ${items.length} items in folder ${currentPath}`);
 
-        // Get local files info
-        const localFiles = fs.existsSync(folderPath)
-            ? fs
-                  .readdirSync(folderPath)
-                  .filter((file) =>
-                      fs.statSync(path.join(folderPath, file)).isFile()
-                  )
-                  .reduce((acc, file) => {
-                      acc[file] = fs.statSync(
-                          path.join(folderPath, file)
-                      ).mtime;
-                      return acc;
-                  }, {})
-            : {};
+            // Process each item
+            for (const item of items) {
+                const itemPath = path.join(currentPath, item.name);
 
-        // Process each file from Google Drive
-        for (const file of driveFiles) {
-            const localPath = path.join(folderPath, file.name);
-            const driveModifiedTime = new Date(file.modifiedTime);
-            const localModifiedTime = localFiles[file.name]
-                ? new Date(localFiles[file.name])
-                : null;
+                if (item.mimeType === "application/vnd.google-apps.folder") {
+                    // Create local folder
+                    if (!fs.existsSync(itemPath)) {
+                        fs.mkdirSync(itemPath, { recursive: true });
+                        log(`Created folder: ${itemPath}`);
+                    }
 
-            // If the file doesn't exist locally or the Drive file is newer, download it
-            if (
-                !localFiles[file.name] || // If the file is missing locally
-                driveModifiedTime > localModifiedTime // If the file on Drive is newer
-            ) {
-                log(
-                    `Downloading ${file.name} (${formatFileSize(file.size)})...`
-                );
-                await downloadLargeFile(drive, file.id, file.name, folderPath);
-            } else {
-                log(`Skipping ${file.name} - local copy is up to date`);
+                    // Recursively process subfolder
+                    await pullFolderContents(item.id, itemPath);
+                } else {
+                    // Handle file
+                    const localModifiedTime = fs.existsSync(itemPath)
+                        ? fs.statSync(itemPath).mtime
+                        : null;
+                    const driveModifiedTime = new Date(item.modifiedTime);
+
+                    if (
+                        !localModifiedTime ||
+                        driveModifiedTime > localModifiedTime
+                    ) {
+                        log(
+                            `Downloading ${item.name} (${formatFileSize(
+                                item.size
+                            )}) to ${itemPath}`
+                        );
+                        await downloadLargeFile(
+                            drive,
+                            item.id,
+                            item.name,
+                            currentPath
+                        );
+                    } else {
+                        log(`Skipping ${item.name} - local copy is up to date`);
+                    }
+                }
             }
         }
 
+        // Start pulling from the root folder
+        await pullFolderContents(driveFolderId, folderPath);
         log("Pull sync completed successfully");
     } catch (error) {
         log(`Error during pull sync: ${error.message}`);

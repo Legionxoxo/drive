@@ -13,6 +13,7 @@ export default function SyncStatus() {
     const [currentFile, setCurrentFile] = useState("");
     const [totalFiles, setTotalFiles] = useState(0);
     const [processedFiles, setProcessedFiles] = useState(0);
+    const [pullFolderPath, setPullFolderPath] = useState("");
 
     useEffect(() => {
         const checkSyncStatus = async () => {
@@ -78,13 +79,20 @@ export default function SyncStatus() {
                 alert("Please select a Google Drive folder first.");
                 return;
             }
+            if (!pullFolderPath) {
+                alert("Please select a local folder to save the files.");
+                return;
+            }
 
-            // Start pull operation
-            await startPull(selectedDriveFolderId);
+            setIsSyncing(true);
+            // Start pull operation with both folder IDs
+            await startPull(selectedDriveFolderId, pullFolderPath);
             setIsSyncing(false);
+            alert("Pull completed successfully!");
         } catch (error) {
             console.error("Error starting pull:", error);
             alert(`Error starting pull: ${error.message}`);
+            setIsSyncing(false);
         }
     };
 
@@ -239,6 +247,71 @@ export default function SyncStatus() {
         }
     };
 
+    const handlePullFolderSelect = async () => {
+        try {
+            const dirHandle = await window.showDirectoryPicker({
+                mode: "readwrite",
+            });
+
+            // Get permission to read/write to the directory
+            const permission = await dirHandle.requestPermission({
+                mode: "readwrite",
+            });
+            if (permission !== "granted") {
+                throw new Error("Permission to access the folder was denied");
+            }
+
+            // Get the full path
+            const fullPath = await getFullPath(dirHandle);
+
+            // Verify the path with the user
+            if (confirm(`Confirm saving files to: ${fullPath}`)) {
+                setPullFolderPath(fullPath);
+                console.log("Selected pull folder path:", fullPath); // Debug log
+            } else {
+                throw new Error("Path selection cancelled by user");
+            }
+        } catch (error) {
+            console.error("Error selecting pull folder:", error);
+            alert(`Error selecting pull folder: ${error.message}`);
+        }
+    };
+
+    // Helper function to get the full path
+    const getFullPath = async (dirHandle) => {
+        try {
+            // First try to get the path from the user
+            const userPath = prompt(
+                "Please enter or confirm the full path where you want to save the files:",
+                `C:\\Users\\${process.env.USERNAME || "User"}\\Downloads\\${
+                    dirHandle.name
+                }`
+            );
+
+            if (!userPath) {
+                throw new Error("No path provided");
+            }
+
+            // Clean up the path - ensure proper Windows path format
+            const cleanPath = userPath
+                .trim()
+                .replace(/[\\/]+/g, "\\") // Replace multiple slashes or backslashes with a single backslash
+                .replace(/\\$/, ""); // Remove trailing slash if present
+
+            // Validate the path format
+            if (!/^[a-zA-Z]:\\/.test(cleanPath)) {
+                throw new Error(
+                    "Invalid path format. Path must start with drive letter (e.g., C:\\)"
+                );
+            }
+
+            return cleanPath;
+        } catch (error) {
+            console.error("Error getting path:", error);
+            throw new Error("Failed to get a valid folder path");
+        }
+    };
+
     return (
         <div className="flex flex-col items-center">
             <div className="mb-4">
@@ -299,6 +372,20 @@ export default function SyncStatus() {
                 )}
             </div>
 
+            <div className="mb-4">
+                <button
+                    onClick={handlePullFolderSelect}
+                    className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+                >
+                    Select Local Folder for Pull
+                </button>
+                {pullFolderPath && (
+                    <p className="mt-2">
+                        Selected local folder: {pullFolderPath}
+                    </p>
+                )}
+            </div>
+
             <p className="mb-4">
                 Status: {isSyncing ? "Syncing" : "Not syncing"}
             </p>
@@ -330,6 +417,7 @@ export default function SyncStatus() {
             <button
                 onClick={handleStartPull}
                 className="mb-4 bg-purple-500 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded"
+                disabled={!selectedDriveFolderId || !pullFolderPath}
             >
                 Start Pull
             </button>
