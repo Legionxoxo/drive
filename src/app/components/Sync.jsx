@@ -9,6 +9,10 @@ export default function SyncStatus() {
     const [selectedFolder, setSelectedFolder] = useState("");
     const [driveFolders, setDriveFolders] = useState([]);
     const [selectedDriveFolderId, setSelectedDriveFolderId] = useState("");
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const [currentFile, setCurrentFile] = useState("");
+    const [totalFiles, setTotalFiles] = useState(0);
+    const [processedFiles, setProcessedFiles] = useState(0);
 
     useEffect(() => {
         const checkSyncStatus = async () => {
@@ -88,27 +92,25 @@ export default function SyncStatus() {
         try {
             console.log("Starting push operation...");
             setIsSyncing(true);
+            setUploadProgress(0);
+            setCurrentFile("");
+            setProcessedFiles(0);
+            setTotalFiles(0);
 
-            // Request directory access
             const dirHandle = await window.showDirectoryPicker({
                 mode: "read",
             });
 
             console.log(`Selected directory: ${dirHandle.name}`);
-
-            // Create an array to store file paths and data
             const files = [];
             const folders = [];
 
-            // Function to recursively process directory
             async function processDirectory(handle, path = "") {
                 console.log(`Processing directory: ${path || handle.name}`);
                 for await (const [name, entry] of handle.entries()) {
                     if (entry.kind === "file") {
-                        console.log(
-                            `Processing file: ${
-                                path ? `${path}/${name}` : name
-                            }`
+                        setCurrentFile(
+                            `Scanning: ${path ? `${path}/${name}` : name}`
                         );
                         const file = await entry.getFile();
                         files.push({
@@ -120,11 +122,6 @@ export default function SyncStatus() {
                             content: await file.arrayBuffer(),
                         });
                     } else if (entry.kind === "directory") {
-                        console.log(
-                            `Found subdirectory: ${
-                                path ? `${path}/${name}` : name
-                            }`
-                        );
                         folders.push({
                             name,
                             path: path ? `${path}/${name}` : name,
@@ -137,13 +134,12 @@ export default function SyncStatus() {
                 }
             }
 
-            // Process the selected directory
             await processDirectory(dirHandle);
+            setTotalFiles(files.length);
             console.log(
                 `Found ${files.length} files and ${folders.length} folders`
             );
 
-            // Send the file and folder data to the server
             console.log("Uploading to Google Drive...");
             const response = await fetch("/api/push", {
                 method: "POST",
@@ -153,14 +149,19 @@ export default function SyncStatus() {
                 body: JSON.stringify({
                     rootFolder: dirHandle.name,
                     folders,
-                    files: files.map((f) => ({
-                        name: f.name,
-                        path: f.path,
-                        lastModified: f.lastModified,
-                        size: f.size,
-                        type: f.type,
-                        content: Array.from(new Uint8Array(f.content)),
-                    })),
+                    files: files.map((f, index) => {
+                        setProcessedFiles(index + 1);
+                        setCurrentFile(`Uploading: ${f.path}`);
+                        setUploadProgress(((index + 1) / files.length) * 100);
+                        return {
+                            name: f.name,
+                            path: f.path,
+                            lastModified: f.lastModified,
+                            size: f.size,
+                            type: f.type,
+                            content: Array.from(new Uint8Array(f.content)),
+                        };
+                    }),
                 }),
             });
 
@@ -170,6 +171,8 @@ export default function SyncStatus() {
             }
 
             console.log("Push operation completed successfully");
+            setUploadProgress(100);
+            setCurrentFile("Completed");
             alert("Push completed successfully!");
             setIsSyncing(false);
         } catch (error) {
@@ -181,6 +184,11 @@ export default function SyncStatus() {
             }
             alert(`Error starting push: ${error.message}`);
             setIsSyncing(false);
+        } finally {
+            setUploadProgress(0);
+            setCurrentFile("");
+            setProcessedFiles(0);
+            setTotalFiles(0);
         }
     };
 
@@ -325,6 +333,28 @@ export default function SyncStatus() {
             >
                 Start Pull
             </button>
+
+            {isSyncing && (
+                <div className="w-full max-w-md mb-4">
+                    <div className="mb-2 flex justify-between">
+                        <span className="text-sm text-gray-600">
+                            {currentFile}
+                        </span>
+                        <span className="text-sm text-gray-600">
+                            {processedFiles} / {totalFiles} files
+                        </span>
+                    </div>
+                    <div className="w-full bg-gray-200 rounded-full h-2.5">
+                        <div
+                            className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+                            style={{ width: `${uploadProgress}%` }}
+                        ></div>
+                    </div>
+                    <div className="mt-1 text-right text-sm text-gray-600">
+                        {Math.round(uploadProgress)}%
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
