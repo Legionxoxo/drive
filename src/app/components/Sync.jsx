@@ -27,15 +27,18 @@ export default function SyncStatus() {
 
     const fetchDriveFolders = async () => {
         try {
+            console.log("Fetching drive folders..."); // Debug log
             const response = await fetch("/api/drive/folders");
+            const data = await response.json();
+
+            console.log("Drive folders response:", data); // Debug log
+
             if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || "Failed to fetch folders");
+                throw new Error(data.error || "Failed to fetch folders");
             }
 
-            const data = await response.json();
             if (data.success && data.folders) {
-                console.log("Fetched folders:", data.folders); // Debug log
+                console.log(`Found ${data.folders.length} folders`); // Debug log
                 setDriveFolders(data.folders);
             } else {
                 throw new Error("No folders data received");
@@ -83,11 +86,101 @@ export default function SyncStatus() {
 
     const handleStartPush = async () => {
         try {
-            await startPush(selectedFolder);
+            console.log("Starting push operation...");
+            setIsSyncing(true);
+
+            // Request directory access
+            const dirHandle = await window.showDirectoryPicker({
+                mode: "read",
+            });
+
+            console.log(`Selected directory: ${dirHandle.name}`);
+
+            // Create an array to store file paths and data
+            const files = [];
+            const folders = [];
+
+            // Function to recursively process directory
+            async function processDirectory(handle, path = "") {
+                console.log(`Processing directory: ${path || handle.name}`);
+                for await (const [name, entry] of handle.entries()) {
+                    if (entry.kind === "file") {
+                        console.log(
+                            `Processing file: ${
+                                path ? `${path}/${name}` : name
+                            }`
+                        );
+                        const file = await entry.getFile();
+                        files.push({
+                            name,
+                            path: path ? `${path}/${name}` : name,
+                            lastModified: file.lastModified,
+                            size: file.size,
+                            type: file.type,
+                            content: await file.arrayBuffer(),
+                        });
+                    } else if (entry.kind === "directory") {
+                        console.log(
+                            `Found subdirectory: ${
+                                path ? `${path}/${name}` : name
+                            }`
+                        );
+                        folders.push({
+                            name,
+                            path: path ? `${path}/${name}` : name,
+                        });
+                        await processDirectory(
+                            entry,
+                            path ? `${path}/${name}` : name
+                        );
+                    }
+                }
+            }
+
+            // Process the selected directory
+            await processDirectory(dirHandle);
+            console.log(
+                `Found ${files.length} files and ${folders.length} folders`
+            );
+
+            // Send the file and folder data to the server
+            console.log("Uploading to Google Drive...");
+            const response = await fetch("/api/push", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    rootFolder: dirHandle.name,
+                    folders,
+                    files: files.map((f) => ({
+                        name: f.name,
+                        path: f.path,
+                        lastModified: f.lastModified,
+                        size: f.size,
+                        type: f.type,
+                        content: Array.from(new Uint8Array(f.content)),
+                    })),
+                }),
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.message || "Failed to push files");
+            }
+
+            console.log("Push operation completed successfully");
+            alert("Push completed successfully!");
             setIsSyncing(false);
         } catch (error) {
             console.error("Error starting push:", error);
+            if (error.name === "AbortError") {
+                console.log("User cancelled directory selection");
+                setIsSyncing(false);
+                return;
+            }
             alert(`Error starting push: ${error.message}`);
+            setIsSyncing(false);
         }
     };
 
@@ -161,10 +254,15 @@ export default function SyncStatus() {
                 </button>
                 {driveFolders.length > 0 ? (
                     <div className="mt-2">
+                        <p>Found {driveFolders.length} folders</p>
                         <select
-                            onChange={(e) =>
-                                setSelectedDriveFolderId(e.target.value)
-                            }
+                            onChange={(e) => {
+                                setSelectedDriveFolderId(e.target.value);
+                                console.log(
+                                    "Selected folder ID:",
+                                    e.target.value
+                                ); // Debug log
+                            }}
                             value={selectedDriveFolderId}
                             className="block w-full p-2 border rounded"
                         >
@@ -175,6 +273,16 @@ export default function SyncStatus() {
                                 </option>
                             ))}
                         </select>
+                        {selectedDriveFolderId && (
+                            <p className="mt-2">
+                                Selected folder:{" "}
+                                {
+                                    driveFolders.find(
+                                        (f) => f.id === selectedDriveFolderId
+                                    )?.name
+                                }
+                            </p>
+                        )}
                     </div>
                 ) : (
                     <p className="mt-2 text-gray-600">
