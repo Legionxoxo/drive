@@ -7,7 +7,7 @@ import { Readable } from "stream";
 // Helper function to create a readable stream from array buffer
 function arrayBufferToStream(buffer) {
     const readable = new Readable();
-    readable._read = () => {}; // _read is required but you can noop it
+    readable._read = () => {}; // _read is required
     readable.push(Buffer.from(buffer));
     readable.push(null);
     return readable;

@@ -376,45 +376,214 @@ export async function startSync(syncFolder) {
     }
 
     const folderPath = path.resolve(syncFolder);
+    log(`Using sync folder: ${folderPath}`);
 
-    const session = await getServerSession(authOptions);
-    if (!session || !session.accessToken) {
-        throw new Error("Not authenticated");
-    }
+    try {
+        const drive = await initializeDrive();
 
-    const oauth2Client = new google.auth.OAuth2();
-    oauth2Client.setCredentials({ access_token: session.accessToken });
+        // Create base folder if it doesn't exist
+        if (!fs.existsSync(folderPath)) {
+            fs.mkdirSync(folderPath, { recursive: true });
+        }
 
-    const drive = google.drive({ version: "v3", auth: oauth2Client });
+        // Create or get the root folder in Drive
+        const rootFolderId = await createOrGetDriveFolder(drive, {
+            name: path.basename(folderPath),
+        });
+        log(`Created/Found root folder with ID: ${rootFolderId}`);
 
-    if (!fs.existsSync(folderPath)) {
-        fs.mkdirSync(folderPath);
-    }
+        // Store folder IDs for quick lookup
+        const folderIds = new Map();
+        folderIds.set(folderPath, rootFolderId);
 
-    const folderId = await createOrGetDriveFolder(drive, folderPath);
-    await initialUpload(drive, folderId, folderPath);
-    await initialDownload(drive, folderId, folderPath);
+        // Initial sync: Create folder structure and upload files
+        log("Starting initial folder structure creation and file upload...");
+        const items = await getDirectoryContents(folderPath);
 
-    watcher = chokidar.watch(folderPath, {
-        ignored: /(^|[\/\\])\../,
-        persistent: true,
-    });
+        // First pass: Create all folders
+        for (const item of items) {
+            if (item.isDirectory) {
+                try {
+                    const parentPath = path.dirname(item.fullPath);
+                    const parentId = folderIds.get(parentPath);
 
-    watcher
-        .on("add", (filePath) => {
-            log(`File added: ${filePath}`);
-            uploadLargeFile(drive, filePath, folderId);
-        })
-        .on("change", (filePath) => {
-            log(`File changed: ${filePath}`);
-            uploadLargeFile(drive, filePath, folderId);
-        })
-        .on("unlink", (filePath) => {
-            log(`File deleted: ${filePath}`);
-            deleteFile(drive, path.basename(filePath), folderId);
+                    if (!parentId) {
+                        log(`Parent folder ID not found for ${item.fullPath}`);
+                        continue;
+                    }
+
+                    log(
+                        `Creating folder: ${item.name} in parent: ${parentPath}`
+                    );
+                    const folderId = await createOrGetDriveFolder(
+                        drive,
+                        { name: item.name },
+                        parentId
+                    );
+                    folderIds.set(item.fullPath, folderId);
+                    log(
+                        `Created/Found folder ${item.name} with ID: ${folderId}`
+                    );
+                } catch (error) {
+                    log(`Error creating folder ${item.name}: ${error.message}`);
+                }
+            }
+        }
+
+        // Second pass: Upload all files
+        for (const item of items) {
+            if (!item.isDirectory) {
+                try {
+                    const parentPath = path.dirname(item.fullPath);
+                    const parentId = folderIds.get(parentPath);
+
+                    if (!parentId) {
+                        log(
+                            `Parent folder ID not found for file ${item.fullPath}`
+                        );
+                        continue;
+                    }
+
+                    log(
+                        `Processing file: ${item.name} in folder: ${parentPath}`
+                    );
+                    await uploadLargeFile(drive, item.fullPath, parentId);
+                } catch (error) {
+                    log(`Error uploading file ${item.name}: ${error.message}`);
+                }
+            }
+        }
+
+        log("Initial upload completed");
+
+        // Set up watcher for file changes
+        if (watcher) {
+            await watcher.close();
+        }
+
+        watcher = chokidar.watch(folderPath, {
+            ignored: /(^|[\/\\])\../, // ignore dotfiles
+            persistent: true,
+            ignoreInitial: true,
+            awaitWriteFinish: {
+                stabilityThreshold: 2000,
+                pollInterval: 100,
+            },
         });
 
-    log("Sync process started");
+        // Helper function to get or create parent folder ID
+        async function getParentFolderId(filePath) {
+            const parentPath = path.dirname(filePath);
+            let parentId = folderIds.get(parentPath);
+
+            if (!parentId) {
+                // Create parent folder structure if it doesn't exist
+                const relativePath = path.relative(folderPath, parentPath);
+                const pathParts = relativePath.split(path.sep);
+                let currentPath = folderPath;
+                let currentParentId = rootFolderId;
+
+                for (const part of pathParts) {
+                    if (!part) continue;
+                    currentPath = path.join(currentPath, part);
+                    let folderId = folderIds.get(currentPath);
+
+                    if (!folderId) {
+                        folderId = await createOrGetDriveFolder(
+                            drive,
+                            { name: part },
+                            currentParentId
+                        );
+                        folderIds.set(currentPath, folderId);
+                    }
+                    currentParentId = folderId;
+                }
+                parentId = currentParentId;
+            }
+
+            return parentId;
+        }
+
+        watcher
+            .on("addDir", async (dirPath) => {
+                try {
+                    if (dirPath === folderPath) return; // Skip root folder
+                    log(`Directory added: ${dirPath}`);
+                    const parentId = await getParentFolderId(dirPath);
+                    const folderId = await createOrGetDriveFolder(
+                        drive,
+                        { name: path.basename(dirPath) },
+                        parentId
+                    );
+                    folderIds.set(dirPath, folderId);
+                } catch (error) {
+                    log(
+                        `Error handling added directory ${dirPath}: ${error.message}`
+                    );
+                }
+            })
+            .on("add", async (filePath) => {
+                try {
+                    log(`File added: ${filePath}`);
+                    const parentId = await getParentFolderId(filePath);
+                    await uploadLargeFile(drive, filePath, parentId);
+                } catch (error) {
+                    log(
+                        `Error handling added file ${filePath}: ${error.message}`
+                    );
+                }
+            })
+            .on("change", async (filePath) => {
+                try {
+                    log(`File changed: ${filePath}`);
+                    const parentId = await getParentFolderId(filePath);
+                    await uploadLargeFile(drive, filePath, parentId);
+                } catch (error) {
+                    log(
+                        `Error handling changed file ${filePath}: ${error.message}`
+                    );
+                }
+            })
+            .on("unlink", async (filePath) => {
+                try {
+                    log(`File deleted: ${filePath}`);
+                    const parentId = await getParentFolderId(filePath);
+                    await deleteFile(drive, path.basename(filePath), parentId);
+                } catch (error) {
+                    log(
+                        `Error handling deleted file ${filePath}: ${error.message}`
+                    );
+                }
+            })
+            .on("unlinkDir", async (dirPath) => {
+                try {
+                    log(`Directory deleted: ${dirPath}`);
+                    const parentId = await getParentFolderId(dirPath);
+                    await deleteFile(drive, path.basename(dirPath), parentId);
+                    folderIds.delete(dirPath);
+                } catch (error) {
+                    log(
+                        `Error handling deleted directory ${dirPath}: ${error.message}`
+                    );
+                }
+            });
+
+        // Update sync status
+        const statusPath = path.join(process.cwd(), ".sync_status");
+        fs.writeFileSync(
+            statusPath,
+            JSON.stringify({
+                isSyncing: true,
+                lastSynced: new Date().toISOString(),
+                selectedFolder: folderPath,
+            })
+        );
+
+        log("Sync process started successfully");
+    } catch (error) {
+        log(`Error during sync process: ${error.message}`);
+        throw error;
+    }
 }
 
 export async function stopSync() {

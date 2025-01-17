@@ -56,11 +56,34 @@ export default function SyncStatus() {
 
     const handleStartSync = async () => {
         try {
-            await startSync(selectedFolder);
+            // Use showDirectoryPicker API to select folder
+            const dirHandle = await window.showDirectoryPicker({
+                mode: "readwrite",
+            });
+
+            // Get permission to read/write to the directory
+            const permission = await dirHandle.requestPermission({
+                mode: "readwrite",
+            });
+            if (permission !== "granted") {
+                throw new Error("Permission to access the folder was denied");
+            }
+
+            // Get the full path
+            const fullPath = await getFullPath(dirHandle);
+            if (!fullPath) {
+                throw new Error("No path provided");
+            }
+
+            setSelectedFolder(fullPath);
             setIsSyncing(true);
+
+            // Start sync operation with the selected folder
+            await startSync(fullPath);
         } catch (error) {
             console.error("Error starting sync:", error);
             alert(`Error starting sync: ${error.message}`);
+            setIsSyncing(false);
         }
     };
 
