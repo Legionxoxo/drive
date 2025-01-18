@@ -384,20 +384,40 @@ export async function startSync(driveFolderId, syncFolder) {
     try {
         const drive = await initializeDrive();
 
+        // Verify target folder exists and is accessible
+        try {
+            const folderCheck = await drive.files.get({
+                fileId: driveFolderId,
+                fields: "name,mimeType",
+            });
+            log(`Target Drive folder verified: ${folderCheck.data.name}`);
+        } catch (error) {
+            log(`Error accessing target Drive folder: ${error.message}`);
+            throw new Error("Cannot access target folder in Drive");
+        }
+
         // Create base folder if it doesn't exist
         if (!fs.existsSync(folderPath)) {
             fs.mkdirSync(folderPath, { recursive: true });
+            log(`Created local folder: ${folderPath}`);
         }
 
         // Store folder IDs for quick lookup
         const folderIds = new Map();
         folderIds.set(folderPath, driveFolderId);
+        log(`Mapped root folder path to Drive folder ID: ${driveFolderId}`);
 
         // Initial sync: Create folder structure and upload files
         log("Starting initial folder structure creation and file upload...");
         const items = await getDirectoryContents(folderPath);
+        log(
+            `Found ${items.filter((i) => i.isDirectory).length} folders and ${
+                items.filter((i) => !i.isDirectory).length
+            } files`
+        );
 
         // First pass: Create all folders
+        log("Creating folder structure in Drive...");
         for (const item of items) {
             if (item.isDirectory) {
                 try {
@@ -410,17 +430,36 @@ export async function startSync(driveFolderId, syncFolder) {
                     }
 
                     log(
-                        `Creating folder: ${item.name} in parent: ${parentPath}`
+                        `Processing folder: ${item.name} in path: ${parentPath}`
                     );
-                    const folderId = await createOrGetDriveFolder(
-                        drive,
-                        { name: item.name },
-                        parentId
-                    );
+
+                    // Check if folder already exists in Drive
+                    const existingFolder = await drive.files.list({
+                        q: `name='${item.name}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`,
+                        fields: "files(id, name)",
+                    });
+
+                    let folderId;
+                    if (existingFolder.data.files.length > 0) {
+                        folderId = existingFolder.data.files[0].id;
+                        log(
+                            `Using existing folder in Drive: ${item.name} (${folderId})`
+                        );
+                    } else {
+                        const response = await drive.files.create({
+                            resource: {
+                                name: item.name,
+                                mimeType: "application/vnd.google-apps.folder",
+                                parents: [parentId],
+                            },
+                            fields: "id, name",
+                        });
+                        folderId = response.data.id;
+                        log(
+                            `Created new folder in Drive: ${item.name} (${folderId})`
+                        );
+                    }
                     folderIds.set(item.fullPath, folderId);
-                    log(
-                        `Created/Found folder ${item.name} with ID: ${folderId}`
-                    );
                 } catch (error) {
                     log(`Error creating folder ${item.name}: ${error.message}`);
                 }
@@ -428,6 +467,7 @@ export async function startSync(driveFolderId, syncFolder) {
         }
 
         // Second pass: Upload all files
+        log("Uploading files to Drive...");
         for (const item of items) {
             if (!item.isDirectory) {
                 try {
@@ -444,9 +484,58 @@ export async function startSync(driveFolderId, syncFolder) {
                     log(
                         `Processing file: ${item.name} in folder: ${parentPath}`
                     );
-                    await uploadLargeFile(drive, item.fullPath, parentId);
+
+                    // Check if file exists in Drive
+                    const existingFile = await drive.files.list({
+                        q: `name='${item.name}' and '${parentId}' in parents and trashed=false`,
+                        fields: "files(id, name, modifiedTime)",
+                    });
+
+                    const localModifiedTime = new Date(
+                        item.modifiedTime
+                    ).getTime();
+                    const shouldUpload =
+                        !existingFile.data.files.length ||
+                        (existingFile.data.files.length > 0 &&
+                            localModifiedTime >
+                                new Date(
+                                    existingFile.data.files[0].modifiedTime
+                                ).getTime());
+
+                    if (shouldUpload) {
+                        const fileStream = fs.createReadStream(item.fullPath);
+                        const media = {
+                            mimeType: "application/octet-stream",
+                            body: fileStream,
+                        };
+
+                        if (existingFile.data.files.length > 0) {
+                            log(`Updating existing file: ${item.name}`);
+                            await drive.files.update({
+                                fileId: existingFile.data.files[0].id,
+                                media: media,
+                                fields: "id, name",
+                            });
+                            log(`Updated file: ${item.name}`);
+                        } else {
+                            log(`Creating new file: ${item.name}`);
+                            const created = await drive.files.create({
+                                resource: {
+                                    name: item.name,
+                                    parents: [parentId],
+                                },
+                                media: media,
+                                fields: "id, name",
+                            });
+                            log(
+                                `Created file: ${item.name} (${created.data.id})`
+                            );
+                        }
+                    } else {
+                        log(`Skipping up-to-date file: ${item.name}`);
+                    }
                 } catch (error) {
-                    log(`Error uploading file ${item.name}: ${error.message}`);
+                    log(`Error processing file ${item.name}: ${error.message}`);
                 }
             }
         }
@@ -456,6 +545,7 @@ export async function startSync(driveFolderId, syncFolder) {
         // Set up watcher for file changes
         if (watcher) {
             await watcher.close();
+            log("Closed existing watcher");
         }
 
         watcher = chokidar.watch(folderPath, {
@@ -486,12 +576,14 @@ export async function startSync(driveFolderId, syncFolder) {
                     let folderId = folderIds.get(currentPath);
 
                     if (!folderId) {
+                        log(`Creating missing folder: ${part}`);
                         folderId = await createOrGetDriveFolder(
                             drive,
                             { name: part },
                             currentParentId
                         );
                         folderIds.set(currentPath, folderId);
+                        log(`Created folder: ${part} (${folderId})`);
                     }
                     currentParentId = folderId;
                 }
@@ -513,6 +605,11 @@ export async function startSync(driveFolderId, syncFolder) {
                         parentId
                     );
                     folderIds.set(dirPath, folderId);
+                    log(
+                        `Created directory in Drive: ${path.basename(
+                            dirPath
+                        )} (${folderId})`
+                    );
                 } catch (error) {
                     log(
                         `Error handling added directory ${dirPath}: ${error.message}`
@@ -524,6 +621,7 @@ export async function startSync(driveFolderId, syncFolder) {
                     log(`File added: ${filePath}`);
                     const parentId = await getParentFolderId(filePath);
                     await uploadLargeFile(drive, filePath, parentId);
+                    log(`Uploaded new file: ${path.basename(filePath)}`);
                 } catch (error) {
                     log(
                         `Error handling added file ${filePath}: ${error.message}`
@@ -535,6 +633,7 @@ export async function startSync(driveFolderId, syncFolder) {
                     log(`File changed: ${filePath}`);
                     const parentId = await getParentFolderId(filePath);
                     await uploadLargeFile(drive, filePath, parentId);
+                    log(`Updated changed file: ${path.basename(filePath)}`);
                 } catch (error) {
                     log(
                         `Error handling changed file ${filePath}: ${error.message}`
@@ -546,6 +645,7 @@ export async function startSync(driveFolderId, syncFolder) {
                     log(`File deleted: ${filePath}`);
                     const parentId = await getParentFolderId(filePath);
                     await deleteFile(drive, path.basename(filePath), parentId);
+                    log(`Deleted file from Drive: ${path.basename(filePath)}`);
                 } catch (error) {
                     log(
                         `Error handling deleted file ${filePath}: ${error.message}`
@@ -558,6 +658,11 @@ export async function startSync(driveFolderId, syncFolder) {
                     const parentId = await getParentFolderId(dirPath);
                     await deleteFile(drive, path.basename(dirPath), parentId);
                     folderIds.delete(dirPath);
+                    log(
+                        `Deleted directory from Drive: ${path.basename(
+                            dirPath
+                        )}`
+                    );
                 } catch (error) {
                     log(
                         `Error handling deleted directory ${dirPath}: ${error.message}`
