@@ -61,30 +61,30 @@ export default function SyncStatus() {
                 return;
             }
 
-            // Use showDirectoryPicker API to select folder
-            const dirHandle = await window.showDirectoryPicker({
-                mode: "readwrite",
-            });
-
-            // Get permission to read/write to the directory
-            const permission = await dirHandle.requestPermission({
-                mode: "readwrite",
-            });
-            if (permission !== "granted") {
-                throw new Error("Permission to access the folder was denied");
+            const selection = await handleFileOrFolderSelect("readwrite");
+            if (!selection) {
+                return;
             }
 
-            // Get the full path
-            const fullPath = await getFullPath(dirHandle);
-            if (!fullPath) {
-                throw new Error("No path provided");
+            if (selection.totalItems === 0) {
+                alert("Please select at least one file or folder to sync");
+                return;
             }
 
-            setSelectedFolder(fullPath);
-            setIsSyncing(true);
+            // For sync, we'll process one item at a time
+            for (const folder of selection.folders) {
+                setSelectedFolder(folder.path);
+                setIsSyncing(true);
+                await startSync(selectedDriveFolderId, folder.path, true);
+            }
 
-            // Start sync operation with both folder IDs
-            await startSync(selectedDriveFolderId, fullPath);
+            for (const file of selection.files) {
+                setSelectedFolder(file.path);
+                setIsSyncing(true);
+                await startSync(selectedDriveFolderId, file.path, false);
+            }
+
+            alert("Sync started successfully!");
         } catch (error) {
             console.error("Error starting sync:", error);
             alert(`Error starting sync: ${error.message}`);
@@ -124,6 +124,94 @@ export default function SyncStatus() {
         }
     };
 
+    const handleFileOrFolderSelect = async (mode = "readwrite") => {
+        try {
+            // Ask user if they want to select files or folders
+            const selectType = window.confirm(
+                "Click OK to select folders, or Cancel to select files"
+            );
+
+            let handles = [];
+            if (selectType) {
+                // User wants to select folders
+                const dirHandle = await window.showDirectoryPicker({
+                    mode: mode,
+                    startIn: "desktop",
+                });
+                handles = [dirHandle];
+            } else {
+                // User wants to select files
+                handles = await window.showOpenFilePicker({
+                    multiple: true,
+                    types: [
+                        {
+                            description: "All Files",
+                            accept: {
+                                "*/*": [],
+                            },
+                        },
+                    ],
+                    excludeAcceptAllOption: false,
+                });
+            }
+
+            const files = [];
+            const folders = [];
+
+            // Process each selected handle
+            for (const handle of handles) {
+                try {
+                    const permission = await handle.requestPermission({
+                        mode: mode,
+                    });
+
+                    if (permission !== "granted") {
+                        throw new Error(`Permission denied for ${handle.name}`);
+                    }
+
+                    const path = await getFullPath(handle);
+
+                    if (selectType) {
+                        // It's a folder
+                        folders.push({
+                            handle,
+                            path,
+                            name: handle.name,
+                            isDirectory: true,
+                        });
+                    } else {
+                        // It's a file
+                        const info = await handle.getFile();
+                        files.push({
+                            handle,
+                            path,
+                            name: handle.name,
+                            type: info.type,
+                            size: info.size,
+                            lastModified: info.lastModified,
+                            isDirectory: false,
+                        });
+                    }
+                } catch (error) {
+                    console.error(`Error processing ${handle.name}:`, error);
+                }
+            }
+
+            return {
+                files,
+                folders,
+                totalItems: files.length + folders.length,
+            };
+        } catch (error) {
+            if (error.name === "AbortError") {
+                console.log("User cancelled selection");
+                return null;
+            }
+            console.error("Error in file/folder selection:", error);
+            throw error;
+        }
+    };
+
     const handleStartPush = async () => {
         try {
             if (!selectedDriveFolderId) {
@@ -138,71 +226,83 @@ export default function SyncStatus() {
             setProcessedFiles(0);
             setTotalFiles(0);
 
-            const dirHandle = await window.showDirectoryPicker({
-                mode: "read",
-            });
-
-            // Get permission to read the directory
-            const permission = await dirHandle.requestPermission({
-                mode: "read",
-            });
-            if (permission !== "granted") {
-                throw new Error("Permission to access the folder was denied");
+            const selection = await handleFileOrFolderSelect("read");
+            if (!selection) {
+                setIsSyncing(false);
+                return;
             }
 
-            console.log(`Selected directory: ${dirHandle.name}`);
-            const files = [];
-            const folders = [];
+            console.log(
+                `Selected ${selection.files.length} files and ${selection.folders.length} folders`
+            );
+            const allFiles = [];
+            const allFolders = [...selection.folders];
 
-            async function processDirectory(handle, path = "") {
-                console.log(`Processing directory: ${path || handle.name}`);
-                for await (const [name, entry] of handle.entries()) {
-                    if (entry.kind === "file") {
-                        setCurrentFile(
-                            `Scanning: ${path ? `${path}/${name}` : name}`
-                        );
-                        const file = await entry.getFile();
-                        files.push({
-                            name,
-                            path: path ? `${path}/${name}` : name,
-                            lastModified: file.lastModified,
-                            size: file.size,
-                            type: file.type,
-                            content: await file.arrayBuffer(),
-                        });
-                    } else if (entry.kind === "directory") {
-                        folders.push({
-                            name,
-                            path: path ? `${path}/${name}` : name,
-                        });
-                        await processDirectory(
-                            entry,
-                            path ? `${path}/${name}` : name
-                        );
+            // Process files directly selected
+            for (const file of selection.files) {
+                const fileHandle = file.handle;
+                const fileInfo = await fileHandle.getFile();
+                allFiles.push({
+                    name: fileInfo.name,
+                    path: file.path,
+                    lastModified: fileInfo.lastModified,
+                    size: fileInfo.size,
+                    type: fileInfo.type,
+                    content: await fileInfo.arrayBuffer(),
+                });
+            }
+
+            // Process folders and their contents
+            for (const folder of selection.folders) {
+                async function processDirectory(handle, basePath = "") {
+                    for await (const [name, entry] of handle.handle.entries()) {
+                        const entryPath = basePath
+                            ? `${basePath}/${name}`
+                            : name;
+
+                        if (entry.kind === "file") {
+                            setCurrentFile(`Scanning: ${entryPath}`);
+                            const file = await entry.getFile();
+                            allFiles.push({
+                                name,
+                                path: entryPath,
+                                lastModified: file.lastModified,
+                                size: file.size,
+                                type: file.type,
+                                content: await file.arrayBuffer(),
+                            });
+                        } else if (entry.kind === "directory") {
+                            allFolders.push({
+                                name,
+                                path: entryPath,
+                            });
+                            await processDirectory(entry, entryPath);
+                        }
                     }
                 }
+                await processDirectory(folder);
             }
 
-            await processDirectory(dirHandle);
-            setTotalFiles(files.length);
+            setTotalFiles(allFiles.length);
             console.log(
-                `Found ${files.length} files and ${folders.length} folders`
+                `Processing ${allFiles.length} files and ${allFolders.length} folders`
             );
 
-            console.log("Uploading to Google Drive...");
+            // Upload to Drive
             const response = await fetch("/api/push", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
-                    rootFolder: dirHandle.name,
                     targetFolderId: selectedDriveFolderId,
-                    folders,
-                    files: files.map((f, index) => {
+                    folders: allFolders,
+                    files: allFiles.map((f, index) => {
                         setProcessedFiles(index + 1);
                         setCurrentFile(`Uploading: ${f.path}`);
-                        setUploadProgress(((index + 1) / files.length) * 100);
+                        setUploadProgress(
+                            ((index + 1) / allFiles.length) * 100
+                        );
                         return {
                             name: f.name,
                             path: f.path,
@@ -224,17 +324,11 @@ export default function SyncStatus() {
             setUploadProgress(100);
             setCurrentFile("Completed");
             alert("Push completed successfully!");
-            setIsSyncing(false);
         } catch (error) {
             console.error("Error starting push:", error);
-            if (error.name === "AbortError") {
-                console.log("User cancelled directory selection");
-                setIsSyncing(false);
-                return;
-            }
             alert(`Error starting push: ${error.message}`);
-            setIsSyncing(false);
         } finally {
+            setIsSyncing(false);
             setUploadProgress(0);
             setCurrentFile("");
             setProcessedFiles(0);
