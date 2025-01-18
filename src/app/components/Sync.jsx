@@ -56,6 +56,11 @@ export default function SyncStatus() {
 
     const handleStartSync = async () => {
         try {
+            if (!selectedDriveFolderId) {
+                alert("Please select a Google Drive folder first.");
+                return;
+            }
+
             // Use showDirectoryPicker API to select folder
             const dirHandle = await window.showDirectoryPicker({
                 mode: "readwrite",
@@ -78,8 +83,8 @@ export default function SyncStatus() {
             setSelectedFolder(fullPath);
             setIsSyncing(true);
 
-            // Start sync operation with the selected folder
-            await startSync(fullPath);
+            // Start sync operation with both folder IDs
+            await startSync(selectedDriveFolderId, fullPath);
         } catch (error) {
             console.error("Error starting sync:", error);
             alert(`Error starting sync: ${error.message}`);
@@ -121,6 +126,11 @@ export default function SyncStatus() {
 
     const handleStartPush = async () => {
         try {
+            if (!selectedDriveFolderId) {
+                alert("Please select a Google Drive folder first.");
+                return;
+            }
+
             console.log("Starting push operation...");
             setIsSyncing(true);
             setUploadProgress(0);
@@ -131,6 +141,14 @@ export default function SyncStatus() {
             const dirHandle = await window.showDirectoryPicker({
                 mode: "read",
             });
+
+            // Get permission to read the directory
+            const permission = await dirHandle.requestPermission({
+                mode: "read",
+            });
+            if (permission !== "granted") {
+                throw new Error("Permission to access the folder was denied");
+            }
 
             console.log(`Selected directory: ${dirHandle.name}`);
             const files = [];
@@ -179,6 +197,7 @@ export default function SyncStatus() {
                 },
                 body: JSON.stringify({
                     rootFolder: dirHandle.name,
+                    targetFolderId: selectedDriveFolderId,
                     folders,
                     files: files.map((f, index) => {
                         setProcessedFiles(index + 1);

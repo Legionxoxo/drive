@@ -369,10 +369,13 @@ async function handleDirectoryEntry(dirHandle, items = [], parentPath = "") {
     }
 }
 
-export async function startSync(syncFolder) {
+export async function startSync(driveFolderId, syncFolder) {
     log("Starting sync process");
+    if (!driveFolderId) {
+        throw new Error("No Drive folder selected for syncing");
+    }
     if (!syncFolder) {
-        throw new Error("No folder selected for syncing");
+        throw new Error("No local folder selected for syncing");
     }
 
     const folderPath = path.resolve(syncFolder);
@@ -386,15 +389,9 @@ export async function startSync(syncFolder) {
             fs.mkdirSync(folderPath, { recursive: true });
         }
 
-        // Create or get the root folder in Drive
-        const rootFolderId = await createOrGetDriveFolder(drive, {
-            name: path.basename(folderPath),
-        });
-        log(`Created/Found root folder with ID: ${rootFolderId}`);
-
         // Store folder IDs for quick lookup
         const folderIds = new Map();
-        folderIds.set(folderPath, rootFolderId);
+        folderIds.set(folderPath, driveFolderId);
 
         // Initial sync: Create folder structure and upload files
         log("Starting initial folder structure creation and file upload...");
@@ -481,7 +478,7 @@ export async function startSync(syncFolder) {
                 const relativePath = path.relative(folderPath, parentPath);
                 const pathParts = relativePath.split(path.sep);
                 let currentPath = folderPath;
-                let currentParentId = rootFolderId;
+                let currentParentId = driveFolderId;
 
                 for (const part of pathParts) {
                     if (!part) continue;
@@ -576,6 +573,7 @@ export async function startSync(syncFolder) {
                 isSyncing: true,
                 lastSynced: new Date().toISOString(),
                 selectedFolder: folderPath,
+                driveFolderId: driveFolderId,
             })
         );
 
