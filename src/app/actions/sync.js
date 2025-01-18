@@ -8,14 +8,45 @@ import path from "path";
 import chokidar from "chokidar";
 import dotenv from "dotenv";
 import { promises as fsPromises } from "fs";
+import crypto from "crypto";
 
 dotenv.config();
 
 let watcher = null;
 
 // Helper function to log messages with a timestamp
-function log(message) {
-    console.log(`[${new Date().toISOString()}] ${message}`);
+function log(message, type = "info") {
+    const timestamp = new Date().toISOString();
+    let prefix = "";
+
+    switch (type) {
+        case "skip":
+            prefix = "🔵 SKIP:";
+            break;
+        case "checksum":
+            prefix = "🔍 CHECKSUM:";
+            break;
+        case "success":
+            prefix = "✅ SUCCESS:";
+            break;
+        case "error":
+            prefix = "❌ ERROR:";
+            break;
+        case "progress":
+            prefix = "📊 PROGRESS:";
+            break;
+        default:
+            prefix = "ℹ️ INFO:";
+    }
+
+    // Force console output for important messages
+    if (type === "checksum" || type === "skip") {
+        console.log("\n-----------------------------------");
+    }
+    console.log(`[${timestamp}] ${prefix} ${message}`);
+    if (type === "checksum" || type === "skip") {
+        console.log("-----------------------------------\n");
+    }
 }
 
 // Helper function to initialize Google Drive client
@@ -78,36 +109,98 @@ async function createOrGetDriveFolder(drive, dirHandle, parentId = null) {
     }
 }
 
+// Add checksum calculation function
+async function calculateFileChecksum(filePath) {
+    return new Promise((resolve, reject) => {
+        const hash = crypto.createHash("md5");
+        const stream = fs.createReadStream(filePath);
+
+        stream.on("data", (data) => hash.update(data));
+        stream.on("end", () => resolve(hash.digest("hex")));
+        stream.on("error", (error) => reject(error));
+    });
+}
+
+// Add function to calculate checksum from file handle
+async function calculateFileHandleChecksum(fileHandle) {
+    const hash = crypto.createHash("md5");
+    const file = await fileHandle.getFile();
+    const arrayBuffer = await file.arrayBuffer();
+    hash.update(Buffer.from(arrayBuffer));
+    return hash.digest("hex");
+}
+
+// Add function to get file metadata including checksum
+async function getFileMetadata(drive, fileId) {
+    try {
+        const response = await drive.files.get({
+            fileId: fileId,
+            fields: "id, name, modifiedTime, appProperties",
+        });
+        return response.data;
+    } catch (error) {
+        log(`Error getting file metadata: ${error.message}`);
+        throw error;
+    }
+}
+
+// Modify uploadLargeFile to include checksum
 async function uploadLargeFile(drive, filePath, folderId) {
     const fileName = path.basename(filePath);
     const fileSize = fs.statSync(filePath).size;
-    const chunkSize = 5 * 1024 * 1024; // 5MB chunks
+
+    // Add clear separator before processing each file
+    console.log("\n========== Processing File ==========");
+    log(`Starting to process: ${fileName}`, "progress");
+
+    // Calculate and log checksum
+    const checksum = await calculateFileChecksum(filePath);
+    log(`Local file checksum for ${fileName}: ${checksum}`, "checksum");
 
     const fileMetadata = {
         name: fileName,
         parents: [folderId],
+        appProperties: {
+            md5Checksum: checksum,
+        },
     };
 
-    // Check if file already exists
-    const existingFileResponse = await drive.files.list({
-        q: `name='${fileName}' and '${folderId}' in parents`,
-        fields: "files(id, modifiedTime)",
-    });
-
     try {
+        // Check existing file
+        const existingFileResponse = await drive.files.list({
+            q: `name='${fileName}' and '${folderId}' in parents`,
+            fields: "files(id, modifiedTime, appProperties)",
+        });
+
         if (existingFileResponse.data.files.length > 0) {
             const driveFile = existingFileResponse.data.files[0];
-            const localMTime = fs.statSync(filePath).mtime.toISOString();
+            const driveChecksum = driveFile.appProperties?.md5Checksum;
 
-            if (new Date(driveFile.modifiedTime) >= new Date(localMTime)) {
-                log(`${fileName} is already up-to-date in Google Drive.`);
-                return;
+            log(
+                `Drive file checksum for ${fileName}: ${
+                    driveChecksum || "not found"
+                }`,
+                "checksum"
+            );
+
+            if (driveChecksum === checksum) {
+                log(`File "${fileName}" - SKIPPED (checksums match)`, "skip");
+                log(`└─ Local:  ${checksum}`, "checksum");
+                log(`└─ Drive:  ${driveChecksum}`, "checksum");
+                console.log("=====================================\n");
+                return driveFile.id;
             }
 
+            log(`Checksums different - updating file`, "progress");
             // Initialize resumable upload session for update
             const res = await drive.files.update(
                 {
                     fileId: driveFile.id,
+                    resource: {
+                        appProperties: {
+                            md5Checksum: checksum,
+                        },
+                    },
                     media: {
                         body: fs.createReadStream(filePath, {
                             highWaterMark: chunkSize,
@@ -116,7 +209,6 @@ async function uploadLargeFile(drive, filePath, folderId) {
                     uploadType: "resumable",
                 },
                 {
-                    // Configure axios for resumable upload
                     onUploadProgress: (evt) => {
                         const progress = (evt.bytesRead / fileSize) * 100;
                         log(
@@ -128,7 +220,7 @@ async function uploadLargeFile(drive, filePath, folderId) {
                 }
             );
 
-            log(`Updated ${fileName} in Google Drive.`);
+            log(`Updated ${fileName} in Google Drive with new checksum.`);
             return res.data.id;
         } else {
             // Initialize resumable upload session for new file
@@ -144,7 +236,6 @@ async function uploadLargeFile(drive, filePath, folderId) {
                     uploadType: "resumable",
                 },
                 {
-                    // Configure axios for resumable upload
                     onUploadProgress: (evt) => {
                         const progress = (evt.bytesRead / fileSize) * 100;
                         log(
@@ -156,19 +247,19 @@ async function uploadLargeFile(drive, filePath, folderId) {
                 }
             );
 
-            log(`Uploaded ${fileName} to Google Drive.`);
+            log(`Uploaded ${fileName} to Google Drive with checksum.`);
             return res.data.id;
         }
     } catch (error) {
         if (error.code === "ECONNRESET" || error.code === "ETIMEDOUT") {
-            // Implement retry logic
             log(`Upload interrupted for ${fileName}. Retrying...`);
-            // You could implement exponential backoff here
             return uploadLargeFile(drive, filePath, folderId);
         }
 
         log(`Error uploading ${fileName}: ${error.message}`);
         throw error;
+    } finally {
+        console.log("=====================================\n");
     }
 }
 
@@ -367,6 +458,162 @@ async function handleDirectoryEntry(dirHandle, items = [], parentPath = "") {
         log(`Error in handleDirectoryEntry: ${error.message}`);
         throw error;
     }
+}
+
+// Modify uploadFileFromHandle to include checksum
+async function uploadFileFromHandle(drive, file, folderId) {
+    const fileMetadata = {
+        name: file.name,
+        parents: [folderId],
+    };
+
+    try {
+        // Calculate checksum from file handle
+        const arrayBuffer = await file.arrayBuffer();
+        const hash = crypto.createHash("md5");
+        hash.update(Buffer.from(arrayBuffer));
+        const checksum = hash.digest("hex");
+        log(`Calculated checksum for ${file.name}: ${checksum}`, "checksum");
+
+        fileMetadata.appProperties = {
+            md5Checksum: checksum,
+        };
+
+        // Check if file exists and compare checksums
+        const existingFileResponse = await drive.files.list({
+            q: `name='${file.name}' and '${folderId}' in parents`,
+            fields: "files(id, appProperties)",
+        });
+
+        if (existingFileResponse.data.files.length > 0) {
+            const driveFile = existingFileResponse.data.files[0];
+            const driveChecksum = driveFile.appProperties?.md5Checksum;
+
+            if (driveChecksum === checksum) {
+                log(`File "${file.name}" skipped - checksums match`, "skip");
+                log(`Local checksum:  ${checksum}`, "checksum");
+                log(`Drive checksum:  ${driveChecksum}`, "checksum");
+                return driveFile.id;
+            }
+        }
+
+        const media = {
+            mimeType: file.type || "application/octet-stream",
+            body: file.stream(),
+        };
+
+        const response = await drive.files.create({
+            resource: fileMetadata,
+            media: media,
+            fields: "id",
+        });
+
+        log(`Uploaded ${file.name} successfully with checksum`);
+        return response.data.id;
+    } catch (error) {
+        log(`Error uploading ${file.name}: ${error.message}`);
+        throw error;
+    }
+}
+
+// Modify startPull to use checksums
+export async function startPull(driveFolderId, localFolderPath) {
+    log("Starting pull sync from Google Drive...");
+    if (!driveFolderId) {
+        throw new Error("No Google Drive folder selected for pulling");
+    }
+    if (!localFolderPath) {
+        throw new Error("No local folder selected for pulling");
+    }
+
+    const normalizedPath = localFolderPath.replace(/\//g, path.sep);
+    const folderPath = path.resolve(normalizedPath);
+    log(`Using local sync folder: ${folderPath}`);
+
+    try {
+        const drive = await initializeDrive();
+
+        if (!fs.existsSync(folderPath)) {
+            fs.mkdirSync(folderPath, { recursive: true });
+        }
+
+        async function pullFolderContents(folderId, currentPath) {
+            const response = await drive.files.list({
+                q: `'${folderId}' in parents and trashed = false`,
+                fields: "files(id, name, mimeType, modifiedTime, size, appProperties)",
+                pageSize: 1000,
+            });
+
+            const items = response.data.files;
+            log(`Found ${items.length} items in folder ${currentPath}`);
+
+            for (const item of items) {
+                const itemPath = path.join(currentPath, item.name);
+
+                if (item.mimeType === "application/vnd.google-apps.folder") {
+                    if (!fs.existsSync(itemPath)) {
+                        fs.mkdirSync(itemPath, { recursive: true });
+                        log(`Created folder: ${itemPath}`);
+                    }
+                    await pullFolderContents(item.id, itemPath);
+                } else {
+                    let shouldDownload = true;
+
+                    if (fs.existsSync(itemPath)) {
+                        const localChecksum = await calculateFileChecksum(
+                            itemPath
+                        );
+                        const driveChecksum = item.appProperties?.md5Checksum;
+
+                        if (driveChecksum && localChecksum === driveChecksum) {
+                            log(
+                                `File "${item.name}" skipped - checksums match`,
+                                "skip"
+                            );
+                            log(
+                                `Local checksum:  ${localChecksum}`,
+                                "checksum"
+                            );
+                            log(
+                                `Drive checksum:  ${driveChecksum}`,
+                                "checksum"
+                            );
+                            shouldDownload = false;
+                        }
+                    }
+
+                    if (shouldDownload) {
+                        log(
+                            `Downloading ${item.name} (${formatFileSize(
+                                item.size
+                            )}) to ${itemPath}`
+                        );
+                        await downloadLargeFile(
+                            drive,
+                            item.id,
+                            item.name,
+                            currentPath
+                        );
+                    }
+                }
+            }
+        }
+
+        await pullFolderContents(driveFolderId, folderPath);
+        log("Pull sync completed successfully");
+    } catch (error) {
+        log(`Error during pull sync: ${error.message}`);
+        throw error;
+    }
+}
+
+// Helper function for formatting file sizes
+function formatFileSize(bytes) {
+    if (bytes === undefined) return "Unknown size";
+    const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
+    if (bytes === 0) return "0 Bytes";
+    const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+    return Math.round((bytes / Math.pow(1024, i)) * 100) / 100 + " " + sizes[i];
 }
 
 export async function startSync(driveFolderId, syncFolder) {
@@ -630,13 +877,69 @@ export async function startSync(driveFolderId, syncFolder) {
             })
             .on("change", async (filePath) => {
                 try {
-                    log(`File changed: ${filePath}`);
                     const parentId = await getParentFolderId(filePath);
-                    await uploadLargeFile(drive, filePath, parentId);
-                    log(`Updated changed file: ${path.basename(filePath)}`);
+                    const fileName = path.basename(filePath);
+
+                    const localChecksum = await calculateFileChecksum(filePath);
+                    log(
+                        `Calculated checksum for ${fileName}: ${localChecksum}`,
+                        "checksum"
+                    );
+
+                    const existingFile = await drive.files.list({
+                        q: `name='${fileName}' and '${parentId}' in parents and trashed=false`,
+                        fields: "files(id, appProperties)",
+                    });
+
+                    if (existingFile.data.files.length > 0) {
+                        const driveFile = existingFile.data.files[0];
+                        const driveChecksum =
+                            driveFile.appProperties?.md5Checksum;
+
+                        if (driveChecksum === localChecksum) {
+                            log(
+                                `File "${fileName}" skipped - checksums match`,
+                                "skip"
+                            );
+                            log(
+                                `Local checksum:  ${localChecksum}`,
+                                "checksum"
+                            );
+                            log(
+                                `Drive checksum:  ${driveChecksum}`,
+                                "checksum"
+                            );
+                            return;
+                        }
+                    }
+
+                    log(
+                        `Processing file: ${fileName} in folder: ${path.dirname(
+                            filePath
+                        )}`
+                    );
+
+                    const file = await item.handle.getFile();
+
+                    if (existingFile.data.files.length === 0) {
+                        log(`Uploading new file: ${fileName}`);
+                        await uploadFileFromHandle(drive, file, parentId);
+                    } else {
+                        const driveFile = existingFile.data.files[0];
+                        const driveModified = new Date(driveFile.modifiedTime);
+                        const localModified = new Date(file.lastModified);
+
+                        if (localModified > driveModified) {
+                            log(`Updating existing file: ${fileName}`);
+                            await uploadFileFromHandle(drive, file, parentId);
+                        } else {
+                            log(`Skipping up-to-date file: ${fileName}`);
+                        }
+                    }
                 } catch (error) {
                     log(
-                        `Error handling changed file ${filePath}: ${error.message}`
+                        `Error handling changed file ${filePath}: ${error.message}`,
+                        "error"
                     );
                 }
             })
@@ -752,170 +1055,76 @@ export async function startPush(dirHandle) {
             }
         }
 
-        // Second pass: Upload files
-        log("Uploading files...");
+        // Second pass: Upload files with enhanced logging
+        log("Starting file upload process...", "progress");
         for (const item of items) {
             if (!item.isDirectory) {
                 try {
+                    console.log("\n========== Processing Item ==========");
                     const parentPath = path.dirname(item.relativePath);
                     const parentId = folderIds.get(parentPath) || rootFolderId;
 
-                    log(
-                        `Processing file: ${item.name} in folder: ${parentPath}`
+                    log(`Processing: ${item.name}`, "progress");
+                    const localChecksum = await calculateFileHandleChecksum(
+                        item.handle
                     );
+                    log(`Local checksum: ${localChecksum}`, "checksum");
 
-                    // Check if file exists in Drive
                     const existingFile = await drive.files.list({
                         q: `name='${item.name}' and '${parentId}' in parents and trashed=false`,
-                        fields: "files(id, modifiedTime)",
+                        fields: "files(id, appProperties)",
                     });
 
-                    const file = await item.handle.getFile();
-
-                    if (existingFile.data.files.length === 0) {
-                        log(`Uploading new file: ${item.name}`);
-                        await uploadFileFromHandle(drive, file, parentId);
-                    } else {
+                    if (existingFile.data.files.length > 0) {
                         const driveFile = existingFile.data.files[0];
-                        const driveModified = new Date(driveFile.modifiedTime);
-                        const localModified = new Date(file.lastModified);
+                        const driveChecksum =
+                            driveFile.appProperties?.md5Checksum;
 
-                        if (localModified > driveModified) {
-                            log(`Updating existing file: ${item.name}`);
-                            await uploadFileFromHandle(drive, file, parentId);
-                        } else {
-                            log(`Skipping up-to-date file: ${item.name}`);
-                        }
-                    }
-                } catch (error) {
-                    log(`Error processing file ${item.name}: ${error.message}`);
-                }
-            }
-        }
-
-        log("Push sync completed successfully");
-    } catch (error) {
-        log(`Error during push sync: ${error.message}`);
-        throw error;
-    }
-}
-
-// New function to handle file uploads from FileSystemFileHandle
-async function uploadFileFromHandle(drive, file, folderId) {
-    const fileMetadata = {
-        name: file.name,
-        parents: [folderId],
-    };
-
-    try {
-        const media = {
-            mimeType: file.type || "application/octet-stream",
-            body: await file.stream(),
-        };
-
-        const response = await drive.files.create({
-            resource: fileMetadata,
-            media: media,
-            fields: "id",
-        });
-
-        log(`Uploaded ${file.name} successfully`);
-        return response.data.id;
-    } catch (error) {
-        log(`Error uploading ${file.name}: ${error.message}`);
-        throw error;
-    }
-}
-
-export async function startPull(driveFolderId, localFolderPath) {
-    log("Starting pull sync from Google Drive...");
-    if (!driveFolderId) {
-        throw new Error("No Google Drive folder selected for pulling");
-    }
-    if (!localFolderPath) {
-        throw new Error("No local folder selected for pulling");
-    }
-
-    const normalizedPath = localFolderPath.replace(/\//g, path.sep);
-    const folderPath = path.resolve(normalizedPath);
-    log(`Using local sync folder: ${folderPath}`);
-
-    try {
-        const drive = await initializeDrive();
-
-        // Create base folder if it doesn't exist
-        if (!fs.existsSync(folderPath)) {
-            fs.mkdirSync(folderPath, { recursive: true });
-        }
-
-        // Helper function to recursively fetch and download files
-        async function pullFolderContents(folderId, currentPath) {
-            // Get all items (files and folders) from the current Drive folder
-            const response = await drive.files.list({
-                q: `'${folderId}' in parents and trashed = false`,
-                fields: "files(id, name, mimeType, modifiedTime, size)",
-                pageSize: 1000,
-            });
-
-            const items = response.data.files;
-            log(`Found ${items.length} items in folder ${currentPath}`);
-
-            // Process each item
-            for (const item of items) {
-                const itemPath = path.join(currentPath, item.name);
-
-                if (item.mimeType === "application/vnd.google-apps.folder") {
-                    // Create local folder
-                    if (!fs.existsSync(itemPath)) {
-                        fs.mkdirSync(itemPath, { recursive: true });
-                        log(`Created folder: ${itemPath}`);
-                    }
-
-                    // Recursively process subfolder
-                    await pullFolderContents(item.id, itemPath);
-                } else {
-                    // Handle file
-                    const localModifiedTime = fs.existsSync(itemPath)
-                        ? fs.statSync(itemPath).mtime
-                        : null;
-                    const driveModifiedTime = new Date(item.modifiedTime);
-
-                    if (
-                        !localModifiedTime ||
-                        driveModifiedTime > localModifiedTime
-                    ) {
                         log(
-                            `Downloading ${item.name} (${formatFileSize(
-                                item.size
-                            )}) to ${itemPath}`
+                            `Drive checksum: ${driveChecksum || "not found"}`,
+                            "checksum"
                         );
-                        await downloadLargeFile(
-                            drive,
-                            item.id,
-                            item.name,
-                            currentPath
+
+                        if (driveChecksum === localChecksum) {
+                            log(
+                                `File "${item.name}" - SKIPPED (checksums match)`,
+                                "skip"
+                            );
+                            log(`└─ Local:  ${localChecksum}`, "checksum");
+                            log(`└─ Drive:  ${driveChecksum}`, "checksum");
+                            console.log(
+                                "=====================================\n"
+                            );
+                            continue;
+                        }
+
+                        log(
+                            `Checksums different - will update file`,
+                            "progress"
                         );
                     } else {
-                        log(`Skipping ${item.name} - local copy is up to date`);
+                        log(
+                            `File not found in Drive - will upload new file`,
+                            "progress"
+                        );
                     }
+
+                    const file = await item.handle.getFile();
+                    await uploadFileFromHandle(drive, file, parentId);
+                } catch (error) {
+                    log(
+                        `Error processing ${item.name}: ${error.message}`,
+                        "error"
+                    );
+                } finally {
+                    console.log("=====================================\n");
                 }
             }
         }
 
-        // Start pulling from the root folder
-        await pullFolderContents(driveFolderId, folderPath);
-        log("Pull sync completed successfully");
+        log("Push sync completed successfully", "success");
     } catch (error) {
-        log(`Error during pull sync: ${error.message}`);
+        log(`Error during push sync: ${error.message}`, "error");
         throw error;
     }
-}
-
-// Helper function for formatting file sizes
-function formatFileSize(bytes) {
-    if (bytes === undefined) return "Unknown size";
-    const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
-    if (bytes === 0) return "0 Bytes";
-    const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
-    return Math.round((bytes / Math.pow(1024, i)) * 100) / 100 + " " + sizes[i];
 }
