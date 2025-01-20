@@ -347,15 +347,36 @@ async function initialDownload(drive, folderId, SYNC_FOLDER) {
     }
 }
 
+/* Move file to Drive trash */
 async function deleteFile(drive, fileName, folderId) {
-    const response = await drive.files.list({
-        q: `name='${fileName}' and '${folderId}' in parents`,
-        fields: "files(id, name)",
-    });
+    try {
+        // Get the file in Drive
+        const response = await drive.files.list({
+            q: `name='${fileName}' and '${folderId}' in parents and trashed=false`,
+            fields: "files(id, name)",
+        });
 
-    if (response.data.files.length > 0) {
-        await drive.files.deleteFile({ fileId: response.data.files[0].id });
-        log(`Deleted ${fileName} from Google Drive.`);
+        if (response.data.files.length > 0) {
+            const fileId = response.data.files[0].id;
+
+            // Move file to trash in Drive
+            await drive.files.update({
+                fileId: fileId,
+                resource: {
+                    trashed: true,
+                },
+            });
+
+            log(`Moved ${fileName} to trash in Google Drive`, "progress");
+        } else {
+            log(`File ${fileName} not found in Google Drive`, "progress");
+        }
+    } catch (error) {
+        log(
+            `Error moving ${fileName} to Drive trash: ${error.message}`,
+            "error"
+        );
+        throw error;
     }
 }
 
