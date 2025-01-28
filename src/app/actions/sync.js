@@ -1,7 +1,5 @@
 "use server";
 
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "../../pages/api/auth/[...nextauth]";
 import { google } from "googleapis";
 import fs from "fs";
 import path from "path";
@@ -9,6 +7,7 @@ import chokidar from "chokidar";
 import dotenv from "dotenv";
 import { promises as fsPromises } from "fs";
 import crypto from "crypto";
+import { cookies } from "next/headers";
 
 dotenv.config();
 
@@ -51,13 +50,33 @@ function log(message, type = "info") {
 
 // Helper function to initialize Google Drive client
 async function initializeDrive() {
-    const session = await getServerSession(authOptions);
-    if (!session?.accessToken) {
+    const cookieStore = cookies();
+    const sessionCookie = cookieStore.get("av_session");
+
+    if (!sessionCookie?.value) {
+        throw new Error("Not authenticated");
+    }
+
+    const response = await fetch(
+        "https://login.myairvault.com/api/v1/session/get",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ session_id: sessionCookie.value }),
+        }
+    );
+
+    const data = await response.json();
+    if (!data.authenticated || !data.user_details?.accessToken) {
         throw new Error("Not authenticated");
     }
 
     const oauth2Client = new google.auth.OAuth2();
-    oauth2Client.setCredentials({ access_token: session.accessToken });
+    oauth2Client.setCredentials({
+        access_token: data.user_details.accessToken,
+    });
 
     return google.drive({ version: "v3", auth: oauth2Client });
 }

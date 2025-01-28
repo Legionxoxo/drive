@@ -1,15 +1,16 @@
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "../pages/api/auth/[...nextauth]";
+"use client";
+
+import { useAuth } from "./hooks/useAuth";
 import SyncStatus from "./components/Sync";
 import Loginbutton from "./components/Login";
 
-export default async function Home() {
-    const session = await getServerSession(authOptions);
+export default function Home() {
+    const { user } = useAuth();
 
     return (
         <main className="flex min-h-screen flex-col items-center justify-center p-24">
             <h1 className="text-4xl font-bold mb-8">Google Drive Sync</h1>
-            {session ? <SyncStatus /> : <Loginbutton />}
+            {user ? <SyncStatus /> : <Loginbutton />}
         </main>
     );
 }

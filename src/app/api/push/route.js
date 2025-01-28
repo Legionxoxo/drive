@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "../../../pages/api/auth/[...nextauth]";
 import { google } from "googleapis";
 import { Readable } from "stream";
+import { cookies } from "next/headers";
 
 // Helper function to create a readable stream from array buffer
 function arrayBufferToStream(buffer) {
@@ -20,8 +19,29 @@ function log(message) {
 
 export async function POST(request) {
     try {
-        const session = await getServerSession(authOptions);
-        if (!session?.accessToken) {
+        const cookieStore = cookies();
+        const sessionCookie = cookieStore.get("av_session");
+
+        if (!sessionCookie?.value) {
+            return NextResponse.json(
+                { error: "Not authenticated" },
+                { status: 401 }
+            );
+        }
+
+        const response = await fetch(
+            "https://login.myairvault.com/api/v1/session/get",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ session_id: sessionCookie.value }),
+            }
+        );
+
+        const data = await response.json();
+        if (!data.authenticated || !data.user_details?.accessToken) {
             return NextResponse.json(
                 { error: "Not authenticated" },
                 { status: 401 }
@@ -42,7 +62,9 @@ export async function POST(request) {
 
         // Initialize Google Drive client
         const oauth2Client = new google.auth.OAuth2();
-        oauth2Client.setCredentials({ access_token: session.accessToken });
+        oauth2Client.setCredentials({
+            access_token: data.user_details.accessToken,
+        });
         const drive = google.drive({ version: "v3", auth: oauth2Client });
 
         // Verify target folder exists and is accessible

@@ -33,12 +33,37 @@ export default function SyncStatus() {
     const fetchDriveFolders = async () => {
         try {
             console.log("Fetching drive folders..."); // Debug log
-            const response = await fetch("/api/drive/folders");
-            const data = await response.json();
+            const accessToken = localStorage.getItem("av_access_token");
+            const refreshToken = localStorage.getItem("av_refresh_token");
 
+            if (!accessToken || !refreshToken) {
+                throw new Error(
+                    "Authentication required. Please log in again."
+                );
+            }
+
+            // Log token format for debugging (only first few characters)
+            console.log("Access Token (first 10 chars):", accessToken);
+            console.log("Refresh Token (first 10 chars):", refreshToken);
+
+            const response = await fetch("/api/drive/folders", {
+                method: "GET",
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    "X-Refresh-Token": refreshToken,
+                },
+            });
+
+            const data = await response.json();
             console.log("Drive folders response:", data); // Debug log
 
             if (!response.ok) {
+                if (response.status === 401) {
+                    // Clear tokens and redirect to login
+                    localStorage.removeItem("av_access_token");
+                    localStorage.removeItem("av_refresh_token");
+                    throw new Error("Session expired. Please log in again.");
+                }
                 throw new Error(data.error || "Failed to fetch folders");
             }
 
@@ -51,6 +76,17 @@ export default function SyncStatus() {
         } catch (error) {
             console.error("Error fetching folders:", error);
             alert(`Error fetching folders: ${error.message}`);
+
+            // Handle authentication errors
+            if (
+                error.message.includes("Authentication required") ||
+                error.message.includes("Session expired")
+            ) {
+                localStorage.removeItem("av_access_token");
+                localStorage.removeItem("av_refresh_token");
+                // Redirect to login or trigger re-login
+                window.location.href = "/";
+            }
         }
     };
 
