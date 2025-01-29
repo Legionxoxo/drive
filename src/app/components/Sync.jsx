@@ -484,6 +484,74 @@ export default function SyncStatus() {
         }
     };
 
+    // Add this new component for recursive folder display
+    function FolderTree({ folder, onSelect, selectedId, level = 0 }) {
+        const [isExpanded, setIsExpanded] = useState(false);
+
+        return (
+            <div style={{ marginLeft: `${level * 20}px` }}>
+                <div className="flex items-center py-1 hover:bg-gray-100 rounded">
+                    <div
+                        className="flex items-center flex-1 cursor-pointer"
+                        onClick={() => onSelect(folder.id)}
+                    >
+                        <span className="w-4 text-gray-500 mr-2">
+                            {folder.children.length > 0 ? (
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        setIsExpanded(!isExpanded);
+                                    }}
+                                    className="focus:outline-none"
+                                >
+                                    {isExpanded ? "▼" : "▶"}
+                                </button>
+                            ) : (
+                                <span className="ml-4"></span>
+                            )}
+                        </span>
+                        <span
+                            className={`px-2 py-1 rounded ${
+                                selectedId === folder.id
+                                    ? "bg-blue-100 text-blue-700"
+                                    : ""
+                            }`}
+                        >
+                            📁 {folder.name}
+                        </span>
+                    </div>
+                </div>
+                {isExpanded && folder.children.length > 0 && (
+                    <div>
+                        {folder.children.map((child) => (
+                            <FolderTree
+                                key={child.id}
+                                folder={child}
+                                onSelect={onSelect}
+                                selectedId={selectedId}
+                                level={level + 1}
+                            />
+                        ))}
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // Add this helper function to find folder names
+    function findFolderName(folders, targetId) {
+        for (const folder of folders) {
+            if (folder.id === targetId) {
+                return folder.name;
+            }
+            if (folder.children.length > 0) {
+                const name = findFolderName(folder.children, targetId);
+                if (name) return name;
+            }
+        }
+        return null;
+    }
+
     return (
         <div className="flex flex-col items-center">
             <div className="mb-4">
@@ -506,34 +574,27 @@ export default function SyncStatus() {
                     Fetch Drive Folders
                 </button>
                 {driveFolders.length > 0 ? (
-                    <div className="mt-2">
-                        <p>Found {driveFolders.length} folders</p>
-                        <select
-                            onChange={(e) => {
-                                setSelectedDriveFolderId(e.target.value);
-                                console.log(
-                                    "Selected folder ID:",
-                                    e.target.value
-                                ); // Debug log
-                            }}
-                            value={selectedDriveFolderId}
-                            className="block w-full p-2 border rounded"
-                        >
-                            <option value="">Select a folder</option>
+                    <div className="mt-2 w-full max-w-md border rounded p-4 bg-white">
+                        <p className="mb-2">
+                            Found {driveFolders.length} folders
+                        </p>
+                        <div className="max-h-60 overflow-y-auto">
                             {driveFolders.map((folder) => (
-                                <option key={folder.id} value={folder.id}>
-                                    {folder.name}
-                                </option>
+                                <FolderTree
+                                    key={folder.id}
+                                    folder={folder}
+                                    onSelect={setSelectedDriveFolderId}
+                                    selectedId={selectedDriveFolderId}
+                                />
                             ))}
-                        </select>
+                        </div>
                         {selectedDriveFolderId && (
-                            <p className="mt-2">
+                            <p className="mt-2 text-sm text-gray-600">
                                 Selected folder:{" "}
-                                {
-                                    driveFolders.find(
-                                        (f) => f.id === selectedDriveFolderId
-                                    )?.name
-                                }
+                                {findFolderName(
+                                    driveFolders,
+                                    selectedDriveFolderId
+                                )}
                             </p>
                         )}
                     </div>
