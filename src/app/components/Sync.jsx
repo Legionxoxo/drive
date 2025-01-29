@@ -42,7 +42,7 @@ export default function SyncStatus() {
                 );
             }
 
-            // Log token format for debugging (only first few characters)
+            // Log token format
             console.log("Access Token (first 10 chars):", accessToken);
             console.log("Refresh Token (first 10 chars):", refreshToken);
 
@@ -484,7 +484,7 @@ export default function SyncStatus() {
         }
     };
 
-    // Add this new component for recursive folder display
+    //component for recursive folder display
     function FolderTree({ folder, onSelect, selectedId, level = 0 }) {
         const [isExpanded, setIsExpanded] = useState(false);
 
@@ -538,7 +538,7 @@ export default function SyncStatus() {
         );
     }
 
-    // Add this helper function to find folder names
+    // helper function to find folder names
     function findFolderName(folders, targetId) {
         for (const folder of folders) {
             if (folder.id === targetId) {
