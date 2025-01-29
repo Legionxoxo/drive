@@ -49,36 +49,33 @@ function log(message, type = "info") {
 }
 
 // Helper function to initialize Google Drive client
-async function initializeDrive() {
-    const cookieStore = cookies();
-    const sessionCookie = cookieStore.get("av_session");
+async function initializeDrive(request) {
+    try {
+        // Get tokens from localStorage
+        const accessToken = localStorage.getItem("av_access_token");
+        const refreshToken = localStorage.getItem("av_refresh_token");
 
-    if (!sessionCookie?.value) {
-        throw new Error("Not authenticated");
-    }
-
-    const response = await fetch(
-        "https://login.myairvault.com/api/v1/session/get",
-        {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ session_id: sessionCookie.value }),
+        if (!accessToken || !refreshToken) {
+            throw new Error("Authentication tokens required");
         }
-    );
 
-    const data = await response.json();
-    if (!data.authenticated || !data.user_details?.accessToken) {
-        throw new Error("Not authenticated");
+        // Initialize OAuth2 client
+        const oauth2Client = new google.auth.OAuth2();
+
+        // Set credentials
+        oauth2Client.setCredentials({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+        });
+
+        // Create and return the Drive client
+        return google.drive({ version: "v3", auth: oauth2Client });
+    } catch (error) {
+        console.error("Error initializing Drive client:", error);
+        throw new Error(
+            "Failed to initialize Google Drive client: " + error.message
+        );
     }
-
-    const oauth2Client = new google.auth.OAuth2();
-    oauth2Client.setCredentials({
-        access_token: data.user_details.accessToken,
-    });
-
-    return google.drive({ version: "v3", auth: oauth2Client });
 }
 
 async function createOrGetDriveFolder(drive, dirHandle, parentId = null) {

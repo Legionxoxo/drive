@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
-import { authConfig } from "../../../../config/auth";
 
 export async function GET(request) {
     try {

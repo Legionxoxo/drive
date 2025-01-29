@@ -255,7 +255,6 @@ export default function SyncStatus() {
                 return;
             }
 
-            console.log("Starting push operation...");
             setIsSyncing(true);
             setUploadProgress(0);
             setCurrentFile("");
@@ -268,9 +267,6 @@ export default function SyncStatus() {
                 return;
             }
 
-            console.log(
-                `Selected ${selection.files.length} files and ${selection.folders.length} folders`
-            );
             const allFiles = [];
             const allFolders = [...selection.folders];
 
@@ -290,17 +286,20 @@ export default function SyncStatus() {
 
             // Process folders and their contents
             for (const folder of selection.folders) {
-                async function processDirectory(handle, basePath = "") {
-                    for await (const [name, entry] of handle.handle.entries()) {
+                async function processDirectory(
+                    directoryHandle,
+                    basePath = ""
+                ) {
+                    for await (const entry of directoryHandle.values()) {
                         const entryPath = basePath
-                            ? `${basePath}/${name}`
-                            : name;
+                            ? `${basePath}/${entry.name}`
+                            : entry.name;
 
                         if (entry.kind === "file") {
                             setCurrentFile(`Scanning: ${entryPath}`);
                             const file = await entry.getFile();
                             allFiles.push({
-                                name,
+                                name: entry.name,
                                 path: entryPath,
                                 lastModified: file.lastModified,
                                 size: file.size,
@@ -309,26 +308,29 @@ export default function SyncStatus() {
                             });
                         } else if (entry.kind === "directory") {
                             allFolders.push({
-                                name,
+                                name: entry.name,
                                 path: entryPath,
                             });
                             await processDirectory(entry, entryPath);
                         }
                     }
                 }
-                await processDirectory(folder);
+                await processDirectory(folder.handle);
             }
 
             setTotalFiles(allFiles.length);
-            console.log(
-                `Processing ${allFiles.length} files and ${allFolders.length} folders`
-            );
 
-            // Upload to Drive
+            const accessToken = localStorage.getItem("av_access_token");
+            const refreshToken = localStorage.getItem("av_refresh_token");
+
             const response = await fetch("/api/push", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
+                    "x-auth-tokens": JSON.stringify({
+                        av_access_token: accessToken,
+                        av_refresh_token: refreshToken,
+                    }),
                 },
                 body: JSON.stringify({
                     targetFolderId: selectedDriveFolderId,
@@ -356,7 +358,6 @@ export default function SyncStatus() {
                 throw new Error(error.message || "Failed to push files");
             }
 
-            console.log("Push operation completed successfully");
             setUploadProgress(100);
             setCurrentFile("Completed");
             alert("Push completed successfully!");
